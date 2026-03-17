@@ -1,0 +1,68 @@
+name: Firebase Sync Deploy Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Git ref to run staging smoke (branch/tag/SHA)"
+        required: false
+        default: "main"
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: firebase-sync-deploy-smoke-${{ github.event_name == 'push' && 'production' || 'staging' }}
+  cancel-in-progress: false
+
+jobs:
+  build_and_smoke:
+    name: ${{ github.event_name == 'push' && 'production-build-smoke' || 'staging-build-smoke' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'push' && 'production' || 'staging' }}
+    permissions:
+      contents: read
+    env:
+      NODE_ENV: production
+      VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
+      VITE_FIREBASE_DB_URL: ${{ secrets.VITE_FIREBASE_DB_URL }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.ref }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate Firebase secret injection
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${VITE_FIREBASE_API_KEY:-}" ]] || { echo "Missing VITE_FIREBASE_API_KEY"; exit 1; }
+          [[ -n "${VITE_FIREBASE_DB_URL:-}" ]] || { echo "Missing VITE_FIREBASE_DB_URL"; exit 1; }
+
+      - name: Build extension
+        run: pnpm run build
+
+      - name: Smoke preview
+        run: pnpm run smoke:preview
+
+      - name: Upload dist artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event_name == 'push' && format('ui-dist-prod-{0}', github.run_number) || format('ui-dist-staging-{0}', github.run_number) }}
+          path: dist
+          if-no-files-found: error

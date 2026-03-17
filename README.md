@@ -114,6 +114,38 @@ pnpm run build
 
 Mở popup → `Connect GitHub`; nếu thành công sẽ thấy trạng thái authenticated và có thể chạy `Sync Now`.
 
+### CI/CD staging + production smoke (PAT-306 unblock)
+
+Workflow: `.github/workflows/firebase-sync-deploy-smoke.yml`
+
+Provision secrets theo từng GitHub Environment (`staging`, `production`) với cùng key:
+
+```bash
+VITE_FIREBASE_API_KEY=<firebase-web-api-key>
+VITE_FIREBASE_DB_URL=https://<project-id>-default-rtdb.firebaseio.com
+```
+
+Luồng chạy job:
+
+1. `Install dependencies`
+2. `Validate Firebase secret injection`
+3. `Build extension`
+4. `Smoke preview` (script `scripts/smoke-preview.sh`)
+5. `Upload dist artifact`
+
+Trigger / rerun cho DevOps:
+
+- Staging: Actions → `Firebase Sync Deploy Smoke` → `Run workflow` (job name: `staging-build-smoke`)
+- Production: push vào `main` (job name: `production-build-smoke`)
+- Nếu cần chạy lại: mở run thất bại và bấm `Re-run failed jobs` cho đúng job name ở trên.
+
+Expected output để pass gate:
+
+- Log có dòng `Smoke passed: preview served HTML at http://127.0.0.1:4173/`
+- Artifact `ui-dist-staging-*` hoặc `ui-dist-prod-*` được upload thành công.
+
+Lưu ý: workflow không `echo` giá trị secrets; chỉ kiểm tra secret có được inject hay không.
+
 ### Load Extension in Chrome
 
 1. Mở Chrome và truy cập `chrome://extensions/`
