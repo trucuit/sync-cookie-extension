@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-required_envs=("VITE_FIREBASE_API_KEY" "VITE_FIREBASE_DB_URL")
+required_envs=("VITE_FIREBASE_PROXY_URL")
 for key in "${required_envs[@]}"; do
   if [[ -z "${!key:-}" ]]; then
     echo "Missing required env: ${key}"

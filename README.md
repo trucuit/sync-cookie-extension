@@ -121,17 +121,17 @@ Workflow: `.github/workflows/firebase-sync-deploy-smoke.yml`
 Provision secrets theo từng GitHub Environment (`staging`, `production`) với cùng key:
 
 ```bash
-VITE_FIREBASE_API_KEY=<firebase-web-api-key>
-VITE_FIREBASE_DB_URL=https://<project-id>-default-rtdb.firebaseio.com
+VITE_FIREBASE_PROXY_URL=https://<your-proxy-domain>
 ```
 
 Luồng chạy job:
 
 1. `Install dependencies`
-2. `Validate Firebase secret injection`
+2. `Validate Firebase proxy injection`
 3. `Build extension`
-4. `Smoke preview` (script `scripts/smoke-preview.sh`)
-5. `Upload dist artifact`
+4. `Security scan build artifact` (script `scripts/check-no-firebase-secrets.sh`)
+5. `Smoke preview` (script `scripts/smoke-preview.sh`)
+6. `Upload dist artifact`
 
 Trigger / rerun cho DevOps:
 
@@ -184,9 +184,13 @@ Lưu ý: workflow không `echo` giá trị secrets; chỉ kiểm tra secret có 
 - **AES-256-GCM encryption** cho toàn bộ cookie data
 - **PBKDF2** key derivation với 100,000 iterations
 - **Random salt và IV** cho mỗi lần encryption
+- **Firebase key/db URL được giữ ở proxy backend**, extension chỉ gọi `VITE_FIREBASE_PROXY_URL`
+- **Firebase ID token được verify ở proxy trước khi push/pull**, và chỉ truy cập `sync/{uid}` tương ứng
+- **Security Rules baseline** nằm tại `firebase/database.rules.json` (để deploy lên Realtime Database)
+- **Threat model + checklist SEC-001** nằm tại `docs/security/firebase-sync-security-model.md`
 - **GitHub OAuth token được lưu dạng encrypted payload trong extension storage**
 - **Zero-knowledge architecture** - password không được lưu
-- **Permission boundary (MVP)**: chỉ cấp host cho `github.com`, `api.github.com`, `*.atlassian.net`, và OAuth proxy `*.run.app`
+- **Permission boundary (MVP)**: chỉ cấp host cho proxy (`*.run.app`, localhost cho debug)
 - **Không inject content script** trong MVP (không dùng content-script scraping)
 
 ## 📁 Project Structure
@@ -201,7 +205,9 @@ sync-cookie-extension/
 │   │   └── PasswordDialog.tsx  # Password input dialog
 │   └── lib/
 │       └── crypto.ts           # AES-256 encryption utilities
-├── oauth-proxy/                # Deployable OAuth code->token exchange proxy
+├── oauth-proxy/                # Deployable OAuth + Firebase proxy
+├── firebase/                   # Firebase security rules baseline
+├── docs/security/              # Security model + verification notes
 ├── public/                     # Static assets (icons)
 ├── dist/                       # Build output
 └── package.json

@@ -1,0 +1,12 @@
+{
+  "name": "sync-cookie-oauth-proxy",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "deploy:cloudrun": "bash ./scripts/deploy-cloud-run.sh",
+    "smoke:public": "bash ./scripts/smoke-public-endpoint.sh \"$BASE_URL\""
+  }
+}

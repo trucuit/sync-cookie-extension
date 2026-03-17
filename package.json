@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "security:artifact": "bash ./scripts/check-no-firebase-secrets.sh dist",
     "smoke:preview": "bash ./scripts/smoke-preview.sh",
     "test": "vitest run",
     "test:watch": "vitest",

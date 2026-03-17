@@ -22,9 +22,20 @@ const STORAGE_KEYS = {
 } as const;
 
 const ENV_CONFIG = {
-  firebaseApiKey: import.meta.env.VITE_FIREBASE_API_KEY ?? '',
-  firebaseDbUrl: import.meta.env.VITE_FIREBASE_DB_URL ?? '',
+  firebaseProxyUrl: import.meta.env.VITE_FIREBASE_PROXY_URL ?? '',
 };
+
+function requireFirebaseProxyUrl() {
+  const proxyUrl = `${ENV_CONFIG.firebaseProxyUrl ?? ''}`.trim();
+  if (!proxyUrl) {
+    throw createCodeError(
+      'config.missing_proxy_url',
+      'Thiếu VITE_FIREBASE_PROXY_URL. Hãy cấu hình Firebase proxy trước khi dùng sync.',
+    );
+  }
+
+  return proxyUrl;
+}
 
 function createCodeError(code: string, message: string, status?: number) {
   const error = new Error(message) as Error & { code?: string; status?: number };
@@ -94,7 +105,7 @@ async function loadSyncSettings() {
 
 const TOKEN_MAX_AGE_MS = 50 * 60 * 1000; // 50 minutes (Firebase tokens expire at 60 min)
 
-async function getValidIdToken(): Promise<{ idToken: string; uid: string }> {
+async function getValidIdToken(proxyBaseUrl: string): Promise<{ idToken: string; uid: string }> {
   const idToken = await getSessionValue<string | null>(STORAGE_KEYS.simpleIdToken, null);
   const uid = await getSessionValue<string | null>(STORAGE_KEYS.simpleUid, null);
 
@@ -116,12 +127,15 @@ async function getValidIdToken(): Promise<{ idToken: string; uid: string }> {
   }
 
   const result = await firebaseRefreshToken({
-    apiKey: ENV_CONFIG.firebaseApiKey,
+    proxyBaseUrl,
     refreshToken: refreshTk,
   });
 
   await setSessionValue(STORAGE_KEYS.simpleIdToken, result.idToken);
   await setSessionValue(STORAGE_KEYS.simpleRefreshToken, result.refreshToken);
+  if (result.uid) {
+    await setSessionValue(STORAGE_KEYS.simpleUid, result.uid);
+  }
   await setSessionValue(STORAGE_KEYS.simpleTokenTimestamp, Date.now());
 
   return { idToken: result.idToken, uid: result.uid ?? uid };
@@ -140,8 +154,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       // ─── Firebase Sync handlers ─────────────────────────────────────
 
       case 'SIMPLE_AUTH_REGISTER': {
+        const proxyBaseUrl = requireFirebaseProxyUrl();
         const result = await firebaseRegister({
-          apiKey: ENV_CONFIG.firebaseApiKey,
+          proxyBaseUrl,
           email: request.email ?? '',
           password: request.password ?? '',
         });
@@ -155,8 +170,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       }
 
       case 'SIMPLE_AUTH_LOGIN': {
+        const proxyBaseUrl = requireFirebaseProxyUrl();
         const result = await firebaseLogin({
-          apiKey: ENV_CONFIG.firebaseApiKey,
+          proxyBaseUrl,
           email: request.email ?? '',
           password: request.password ?? '',
         });
@@ -181,7 +197,8 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       }
 
       case 'SIMPLE_SYNC_PUSH': {
-        const { idToken, uid } = await getValidIdToken();
+        const proxyBaseUrl = requireFirebaseProxyUrl();
+        const { idToken } = await getValidIdToken(proxyBaseUrl);
 
         const syncPassword = request.password ?? '';
         if (!syncPassword.trim()) {
@@ -201,9 +218,8 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         });
 
         await firebasePush({
-          dbUrl: ENV_CONFIG.firebaseDbUrl,
+          proxyBaseUrl,
           idToken,
-          uid,
           payload: JSON.stringify(encrypted),
         });
 
@@ -217,7 +233,8 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       }
 
       case 'SIMPLE_SYNC_PULL': {
-        const { idToken, uid } = await getValidIdToken();
+        const proxyBaseUrl = requireFirebaseProxyUrl();
+        const { idToken } = await getValidIdToken(proxyBaseUrl);
 
         const syncPassword = request.password ?? '';
         if (!syncPassword.trim()) {
@@ -225,9 +242,8 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
 
         const pullResult = await firebasePull({
-          dbUrl: ENV_CONFIG.firebaseDbUrl,
+          proxyBaseUrl,
           idToken,
-          uid,
         });
         const encryptedPayload = JSON.parse(pullResult.payload);
 

@@ -15,7 +15,7 @@ describe('extension manifest security settings', () => {
     expect(manifest.content_security_policy?.extension_pages).toContain("object-src 'self'");
   });
 
-  it('keeps permissions minimal for Firebase sync scope', () => {
+  it('keeps permissions minimal for proxy-based sync scope', () => {
     const manifestPath = resolve(process.cwd(), 'src/manifest.json');
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
       permissions?: string[];
@@ -31,9 +31,9 @@ describe('extension manifest security settings', () => {
     expect(manifest.permissions).not.toContain('alarms');
 
     expect(manifest.host_permissions).toEqual([
-      'https://*.firebaseio.com/*',
-      'https://identitytoolkit.googleapis.com/*',
-      'https://securetoken.googleapis.com/*',
+      'https://*.run.app/*',
+      'http://localhost/*',
+      'http://127.0.0.1/*',
     ]);
     expect(manifest.host_permissions).not.toContain('<all_urls>');
     expect(manifest.content_scripts ?? []).toHaveLength(0);

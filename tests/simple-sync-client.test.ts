@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-describe('simple-sync-client (Firebase REST)', () => {
+describe('simple-sync-client (Firebase proxy)', () => {
   const mockFetch = vi.fn();
 
   beforeEach(() => {
@@ -19,19 +19,23 @@ describe('simple-sync-client (Firebase REST)', () => {
   }
 
   describe('firebaseRegister', () => {
-    it('returns tokens on successful registration', async () => {
+    it('calls proxy register endpoint and returns tokens', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           idToken: 'id-tk',
           refreshToken: 'ref-tk',
-          localId: 'uid-1',
+          uid: 'uid-1',
           email: 'a@b.com',
         }),
       });
 
       const { firebaseRegister } = await importClient();
-      const result = await firebaseRegister({ apiKey: 'key', email: 'a@b.com', password: '123456' });
+      const result = await firebaseRegister({
+        proxyBaseUrl: 'https://proxy.example.com',
+        email: 'a@b.com',
+        password: '123456',
+      });
 
       expect(result).toEqual({
         idToken: 'id-tk',
@@ -41,149 +45,153 @@ describe('simple-sync-client (Firebase REST)', () => {
       });
 
       expect(mockFetch).toHaveBeenCalledOnce();
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain('signUp');
-      expect(url).toContain('key=key');
+      const [url, options] = mockFetch.mock.calls[0];
+      expect(url).toBe('https://proxy.example.com/firebase/auth/register');
+      expect(options.method).toBe('POST');
+      expect(options.body).toContain('"email":"a@b.com"');
     });
 
-    it('throws on registration failure', async () => {
+    it('maps proxy errors on register failure', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: false,
         status: 400,
-        json: async () => ({ error: { message: 'EMAIL_EXISTS' } }),
+        json: async () => ({
+          error: 'firebase.register_failed',
+          message: 'Email đã được đăng ký.',
+        }),
       });
 
       const { firebaseRegister } = await importClient();
-      await expect(firebaseRegister({ apiKey: 'key', email: 'a@b.com', password: '123' }))
-        .rejects.toThrow();
+      await expect(firebaseRegister({
+        proxyBaseUrl: 'https://proxy.example.com',
+        email: 'a@b.com',
+        password: '123456',
+      })).rejects.toThrow('Email đã được đăng ký.');
     });
   });
 
   describe('firebaseLogin', () => {
-    it('returns tokens on successful login', async () => {
+    it('calls proxy login endpoint', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
-          idToken: 'id-tk-2',
-          refreshToken: 'ref-tk-2',
-          localId: 'uid-2',
+          idToken: 'id-login',
+          refreshToken: 'ref-login',
+          uid: 'uid-2',
           email: 'c@d.com',
         }),
       });
 
       const { firebaseLogin } = await importClient();
-      const result = await firebaseLogin({ apiKey: 'key', email: 'c@d.com', password: '999' });
+      const result = await firebaseLogin({
+        proxyBaseUrl: 'https://proxy.example.com/',
+        email: 'c@d.com',
+        password: '999999',
+      });
 
-      expect(result.idToken).toBe('id-tk-2');
-      expect(result.uid).toBe('uid-2');
-
+      expect(result.idToken).toBe('id-login');
       const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain('signInWithPassword');
+      expect(url).toBe('https://proxy.example.com/firebase/auth/login');
     });
   });
 
   describe('firebaseRefreshToken', () => {
-    it('returns new tokens on successful refresh', async () => {
+    it('calls proxy refresh endpoint', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
-          id_token: 'new-id-tk',
-          refresh_token: 'new-ref-tk',
-          user_id: 'uid-1',
+          idToken: 'new-id-tk',
+          refreshToken: 'new-ref-tk',
+          uid: 'uid-1',
         }),
       });
 
       const { firebaseRefreshToken } = await importClient();
-      const result = await firebaseRefreshToken({ apiKey: 'key', refreshToken: 'old-ref-tk' });
-
-      expect(result.idToken).toBe('new-id-tk');
-      expect(result.refreshToken).toBe('new-ref-tk');
-
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain('securetoken.googleapis.com');
-    });
-
-    it('throws on refresh failure', async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 401,
-        json: async () => ({ error: { message: 'TOKEN_EXPIRED' } }),
+      const result = await firebaseRefreshToken({
+        proxyBaseUrl: 'https://proxy.example.com',
+        refreshToken: 'old-ref-tk',
       });
 
-      const { firebaseRefreshToken } = await importClient();
-      await expect(firebaseRefreshToken({ apiKey: 'key', refreshToken: 'bad' }))
-        .rejects.toThrow();
+      expect(result).toEqual({
+        idToken: 'new-id-tk',
+        refreshToken: 'new-ref-tk',
+        uid: 'uid-1',
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toBe('https://proxy.example.com/firebase/auth/refresh');
     });
   });
 
   describe('firebasePush', () => {
-    it('pushes data to Firebase RTDB', async () => {
+    it('pushes data through proxy', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ payload: '{}', updatedAt: '2026-01-01T00:00:00Z' }),
+        json: async () => ({ ok: true, updatedAt: '2026-01-01T00:00:00Z', uid: 'uid-1' }),
       });
 
       const { firebasePush } = await importClient();
-      await firebasePush({
-        dbUrl: 'https://db.firebaseio.com',
+      const result = await firebasePush({
+        proxyBaseUrl: 'https://proxy.example.com',
         idToken: 'tk',
-        uid: 'uid',
         payload: '{"data":1}',
       });
 
-      expect(mockFetch).toHaveBeenCalledOnce();
+      expect(result.ok).toBe(true);
+      expect(result.uid).toBe('uid-1');
       const [url, options] = mockFetch.mock.calls[0];
-      expect(url).toContain('/sync/uid.json');
-      expect(options.method).toBe('PUT');
+      expect(url).toBe('https://proxy.example.com/firebase/sync/push');
+      expect(options.body).toContain('"idToken":"tk"');
     });
   });
 
   describe('firebasePull', () => {
-    it('pulls data from Firebase RTDB', async () => {
+    it('pulls data through proxy', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
+          ok: true,
           payload: '{"cookies":[]}',
           updatedAt: '2026-01-01T00:00:00Z',
+          uid: 'uid-1',
         }),
       });
 
       const { firebasePull } = await importClient();
       const result = await firebasePull({
-        dbUrl: 'https://db.firebaseio.com',
+        proxyBaseUrl: 'https://proxy.example.com',
         idToken: 'tk',
-        uid: 'uid',
       });
 
       expect(result.payload).toBe('{"cookies":[]}');
-      expect(result.updatedAt).toBe('2026-01-01T00:00:00Z');
-
       const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain('/sync/uid.json');
+      expect(url).toBe('https://proxy.example.com/firebase/sync/pull');
     });
 
-    it('throws when no data exists', async () => {
+    it('throws when payload is empty', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => null,
+        json: async () => ({ ok: true, payload: null }),
       });
 
       const { firebasePull } = await importClient();
       await expect(firebasePull({
-        dbUrl: 'https://db.firebaseio.com',
+        proxyBaseUrl: 'https://proxy.example.com',
         idToken: 'tk',
-        uid: 'uid',
-      })).rejects.toThrow();
+      })).rejects.toThrow(/No synced data/i);
     });
   });
 
   describe('network errors', () => {
-    it('wraps fetch errors with a friendly message', async () => {
+    it('wraps fetch errors with a proxy-friendly message', async () => {
       mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
 
       const { firebaseRegister } = await importClient();
-      await expect(firebaseRegister({ apiKey: 'k', email: 'a@b.c', password: 'p' }))
-        .rejects.toThrow(/network/i);
+      await expect(firebaseRegister({
+        proxyBaseUrl: 'https://proxy.example.com',
+        email: 'a@b.c',
+        password: 'p',
+      })).rejects.toThrow(/proxy/i);
     });
   });
 });

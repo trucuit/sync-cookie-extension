@@ -2,11 +2,11 @@
 // @ts-nocheck
 
 /**
- * Firebase Sync Client — Firebase Auth + Realtime Database via REST API.
- * No SDK needed. All cookie data is encrypted client-side before sending.
+ * Firebase Sync Client — all Firebase calls are routed through backend proxy.
+ * This keeps Firebase API key/database URL out of extension bundles.
  */
 
-const FIREBASE_AUTH_BASE = 'https://identitytoolkit.googleapis.com/v1/accounts';
+const REQUEST_TIMEOUT_MS = 12_000;
 
 function createSyncError(code, message, status) {
   const error = new Error(message);
@@ -17,168 +17,142 @@ function createSyncError(code, message, status) {
   return error;
 }
 
-// ─── Firebase Auth REST API ────────────────────────────────────────────────────
+function ensureProxyBaseUrl(proxyBaseUrl) {
+  if (typeof proxyBaseUrl !== 'string' || !proxyBaseUrl.trim()) {
+    throw createSyncError('config.missing_proxy_url', 'Firebase proxy URL is missing.');
+  }
 
-export async function firebaseRegister({ apiKey, email, password }) {
-  const url = `${FIREBASE_AUTH_BASE}:signUp?key=${apiKey}`;
+  return proxyBaseUrl.replace(/\/+$/, '');
+}
+
+async function proxyPost({ proxyBaseUrl, path, payload, fallbackCode, fallbackMessage }) {
+  const baseUrl = ensureProxyBaseUrl(proxyBaseUrl);
+  const url = `${baseUrl}${path}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   let response;
   try {
     response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
-  } catch {
-    throw createSyncError('firebase.network_error', 'Cannot connect to Firebase. Check your network.');
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw createSyncError('proxy.timeout', 'Firebase proxy timeout. Please retry.');
+    }
+
+    throw createSyncError('proxy.network_error', 'Cannot connect to Firebase proxy. Check your network.');
+  } finally {
+    clearTimeout(timeout);
   }
 
-  const data = await response.json();
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
 
   if (!response.ok) {
-    const fbError = data?.error?.message ?? 'Registration failed.';
-    const friendlyMessage = firebaseErrorMessage(fbError);
-    throw createSyncError('firebase.register_failed', friendlyMessage, response.status);
+    throw createSyncError(
+      data?.error ?? fallbackCode,
+      data?.message ?? fallbackMessage,
+      response.status,
+    );
   }
+
+  return data ?? {};
+}
+
+export async function firebaseRegister({ proxyBaseUrl, email, password }) {
+  const data = await proxyPost({
+    proxyBaseUrl,
+    path: '/firebase/auth/register',
+    payload: { email, password },
+    fallbackCode: 'firebase.register_failed',
+    fallbackMessage: 'Registration failed.',
+  });
 
   return {
     idToken: data.idToken,
     refreshToken: data.refreshToken,
-    uid: data.localId,
+    uid: data.uid,
     email: data.email,
   };
 }
 
-export async function firebaseLogin({ apiKey, email, password }) {
-  const url = `${FIREBASE_AUTH_BASE}:signInWithPassword?key=${apiKey}`;
-
-  let response;
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    });
-  } catch {
-    throw createSyncError('firebase.network_error', 'Cannot connect to Firebase. Check your network.');
-  }
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    const fbError = data?.error?.message ?? 'Login failed.';
-    const friendlyMessage = firebaseErrorMessage(fbError);
-    throw createSyncError('firebase.login_failed', friendlyMessage, response.status);
-  }
+export async function firebaseLogin({ proxyBaseUrl, email, password }) {
+  const data = await proxyPost({
+    proxyBaseUrl,
+    path: '/firebase/auth/login',
+    payload: { email, password },
+    fallbackCode: 'firebase.login_failed',
+    fallbackMessage: 'Login failed.',
+  });
 
   return {
     idToken: data.idToken,
     refreshToken: data.refreshToken,
-    uid: data.localId,
+    uid: data.uid,
     email: data.email,
   };
 }
 
-export async function firebaseRefreshToken({ apiKey, refreshToken }) {
-  const url = `https://securetoken.googleapis.com/v1/token?key=${apiKey}`;
-
-  let response;
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
-    });
-  } catch {
-    throw createSyncError('firebase.network_error', 'Cannot connect to Firebase.');
-  }
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw createSyncError('firebase.refresh_failed', 'Session expired. Please login again.', response.status);
-  }
+export async function firebaseRefreshToken({ proxyBaseUrl, refreshToken }) {
+  const data = await proxyPost({
+    proxyBaseUrl,
+    path: '/firebase/auth/refresh',
+    payload: { refreshToken },
+    fallbackCode: 'firebase.refresh_failed',
+    fallbackMessage: 'Session expired. Please login again.',
+  });
 
   return {
-    idToken: data.id_token,
-    refreshToken: data.refresh_token,
-    uid: data.user_id,
+    idToken: data.idToken,
+    refreshToken: data.refreshToken,
+    uid: data.uid,
   };
 }
 
-// ─── Firebase Realtime Database REST API ───────────────────────────────────────
+export async function firebasePush({ proxyBaseUrl, idToken, payload }) {
+  const data = await proxyPost({
+    proxyBaseUrl,
+    path: '/firebase/sync/push',
+    payload: { idToken, payload },
+    fallbackCode: 'firebase.push_failed',
+    fallbackMessage: 'Failed to push cookie data.',
+  });
 
-export async function firebasePush({ dbUrl, idToken, uid, payload }) {
-  const url = `${dbUrl}/sync/${uid}.json?auth=${idToken}`;
-
-  let response;
-  try {
-    response = await fetch(url, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        payload,
-        updatedAt: new Date().toISOString(),
-      }),
-    });
-  } catch {
-    throw createSyncError('firebase.network_error', 'Cannot connect to Firebase Database.');
-  }
-
-  if (!response.ok) {
-    const data = await response.json().catch(() => null);
-    throw createSyncError('firebase.push_failed', data?.error ?? 'Failed to push cookie data.', response.status);
-  }
-
-  return { ok: true, updatedAt: new Date().toISOString() };
+  return {
+    ok: data.ok === true,
+    updatedAt: data.updatedAt ?? null,
+    uid: data.uid ?? null,
+  };
 }
 
-export async function firebasePull({ dbUrl, idToken, uid }) {
-  const url = `${dbUrl}/sync/${uid}.json?auth=${idToken}`;
-
-  let response;
-  try {
-    response = await fetch(url, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-    });
-  } catch {
-    throw createSyncError('firebase.network_error', 'Cannot connect to Firebase Database.');
-  }
-
-  if (!response.ok) {
-    const data = await response.json().catch(() => null);
-    throw createSyncError('firebase.pull_failed', data?.error ?? 'Failed to pull cookie data.', response.status);
-  }
-
-  const data = await response.json();
+export async function firebasePull({ proxyBaseUrl, idToken }) {
+  const data = await proxyPost({
+    proxyBaseUrl,
+    path: '/firebase/sync/pull',
+    payload: { idToken },
+    fallbackCode: 'firebase.pull_failed',
+    fallbackMessage: 'Failed to pull cookie data.',
+  });
 
   if (!data || !data.payload) {
     throw createSyncError('firebase.no_data', 'No synced data found. Push cookies first.', 404);
   }
 
   return {
-    ok: true,
+    ok: data.ok === true,
     payload: data.payload,
     updatedAt: data.updatedAt ?? null,
+    uid: data.uid ?? null,
   };
-}
-
-// ─── Helpers ───────────────────────────────────────────────────────────────────
-
-function firebaseErrorMessage(errorCode) {
-  const messages = {
-    EMAIL_EXISTS: 'Email đã được đăng ký.',
-    EMAIL_NOT_FOUND: 'Email hoặc password không đúng.',
-    INVALID_PASSWORD: 'Email hoặc password không đúng.',
-    INVALID_EMAIL: 'Email không hợp lệ.',
-    WEAK_PASSWORD: 'Password phải ít nhất 6 ký tự.',
-    USER_DISABLED: 'Tài khoản đã bị vô hiệu hoá.',
-    TOO_MANY_ATTEMPTS_TRY_LATER: 'Quá nhiều lần thử. Vui lòng thử lại sau.',
-    INVALID_LOGIN_CREDENTIALS: 'Email hoặc password không đúng.',
-  };
-
-  // Firebase returns errors like "WEAK_PASSWORD : Password should be at least 6 characters"
-  const baseCode = errorCode.split(':')[0].trim();
-  return messages[baseCode] ?? errorCode;
 }

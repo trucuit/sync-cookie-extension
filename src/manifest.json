@@ -9,9 +9,9 @@
     "tabs"
   ],
   "host_permissions": [
-    "https://*.firebaseio.com/*",
-    "https://identitytoolkit.googleapis.com/*",
-    "https://securetoken.googleapis.com/*"
+    "https://*.run.app/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "action": {
     "default_popup": "index.html",
