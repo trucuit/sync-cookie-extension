@@ -6,11 +6,15 @@
   "permissions": [
     "cookies",
     "storage",
-    "activeTab",
-    "tabs"
+    "tabs",
+    "identity",
+    "alarms"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://github.com/*",
+    "https://api.github.com/*",
+    "https://*.atlassian.net/*",
+    "https://*.run.app/*"
   ],
   "action": {
     "default_popup": "index.html",
@@ -30,5 +34,8 @@
   "background": {
     "service_worker": "src/background.ts",
     "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';"
   }
 }

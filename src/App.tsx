@@ -1,22 +1,159 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import './App.css';
 import { PasswordDialog } from './components/PasswordDialog';
-import { encrypt, decrypt } from './lib/crypto';
+import { decrypt, encrypt } from './lib/crypto';
 
 type DialogType = 'export' | 'import' | null;
+type OperationStatus = 'idle' | 'syncing' | 'synced' | 'error';
+type CloudSyncMode = 'push' | 'pull' | 'bidirectional';
+
+type BackgroundError = {
+  code?: string;
+  message: string;
+};
+
+type StatusSnapshot = {
+  auth: {
+    connected: boolean;
+    tokenStored: boolean;
+    profile: {
+      login: string | null;
+    } | null;
+    config: {
+      hasGithubClientId: boolean;
+      hasOAuthProxyUrl: boolean;
+    };
+  };
+  sync: {
+    metadata: {
+      gistId: string | null;
+      revision: string | null;
+      lastSyncedAt: string | null;
+      manifestVersion: number | null;
+      syncVersion: number;
+    };
+    settings: {
+      autoSyncIntervalMinutes: number;
+      domainWhitelist: string[];
+    };
+    runtimeState: {
+      source?: string;
+      mode?: string;
+      status?: string;
+      reason?: string;
+      error?: { message?: string };
+      updatedAt?: string;
+    } | null;
+    hasSessionPassword: boolean;
+  };
+};
+
+type BackgroundResponse<T> =
+  | {
+      ok: true;
+      data: T;
+    }
+  | {
+      ok: false;
+      error: BackgroundError;
+    };
+
+function normalizeDomainList(value: string) {
+  return [...new Set(value.split(/[\n,]+/).map((item) => item.trim().toLowerCase()).filter(Boolean))];
+}
+
+function formatTimestamp(value: string | null) {
+  if (!value) {
+    return 'Chưa có';
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleString();
+}
+
+async function sendBackgroundMessage<T>(request: unknown): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    chrome.runtime.sendMessage(request, (response: BackgroundResponse<T> | undefined) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(new Error(runtimeError.message));
+        return;
+      }
+
+      if (!response) {
+        reject(new Error('Không nhận được phản hồi từ service worker.'));
+        return;
+      }
+
+      if (!response.ok) {
+        reject(new Error(response.error?.message ?? 'Background request thất bại.'));
+        return;
+      }
+
+      resolve(response.data);
+    });
+  });
+}
 
 function App() {
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+  const [localStatus, setLocalStatus] = useState<OperationStatus>('idle');
+  const [cloudStatus, setCloudStatus] = useState<OperationStatus>('idle');
   const [dialogType, setDialogType] = useState<DialogType>(null);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [syncPassword, setSyncPassword] = useState('');
+  const [statusSnapshot, setStatusSnapshot] = useState<StatusSnapshot | null>(null);
+  const [domainWhitelistInput, setDomainWhitelistInput] = useState('');
+  const [autoSyncInterval, setAutoSyncInterval] = useState('5');
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+
+  const cloudBadge = useMemo(() => {
+    if (cloudStatus === 'syncing') {
+      return 'Cloud syncing...';
+    }
+    if (cloudStatus === 'synced') {
+      return 'Cloud synced ✓';
+    }
+    if (cloudStatus === 'error') {
+      return 'Cloud error ✗';
+    }
+    return 'Cloud idle';
+  }, [cloudStatus]);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const snapshot = await sendBackgroundMessage<StatusSnapshot>({
+        type: 'SYNC_GET_STATUS',
+      });
+      setStatusSnapshot(snapshot);
+
+      if (!settingsLoaded) {
+        setAutoSyncInterval(`${snapshot.sync.settings.autoSyncIntervalMinutes}`);
+        setDomainWhitelistInput(snapshot.sync.settings.domainWhitelist.join('\n'));
+        setSettingsLoaded(true);
+      }
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : 'Không đọc được trạng thái cloud sync.');
+    }
+  }, [settingsLoaded]);
+
+  useEffect(() => {
+    void refreshStatus();
+  }, [refreshStatus]);
 
   const handleExportWithPassword = async (password: string) => {
     try {
       setDialogType(null);
-      setSyncStatus('syncing');
+      setLocalStatus('syncing');
 
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab.url) throw new Error('No active tab');
+      if (!tab.url) {
+        throw new Error('No active tab');
+      }
 
       const url = new URL(tab.url);
       const domain = url.hostname;
@@ -27,7 +164,7 @@ function App() {
         version: '1.0.0',
         timestamp: Date.now(),
         domain,
-        cookies: cookies.map(cookie => ({
+        cookies: cookies.map((cookie) => ({
           name: cookie.name,
           value: cookie.value,
           domain: cookie.domain,
@@ -48,54 +185,54 @@ function App() {
       };
 
       const blob = new Blob([JSON.stringify(encryptedData, null, 2)], { type: 'application/json' });
-      const url_blob = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url_blob;
-      a.download = `cookies-${domain}-${Date.now()}.encrypted.json`;
-      a.click();
-      URL.revokeObjectURL(url_blob);
+      const blobUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = `cookies-${domain}-${Date.now()}.encrypted.json`;
+      anchor.click();
+      URL.revokeObjectURL(blobUrl);
 
-      setSyncStatus('synced');
-      setTimeout(() => setSyncStatus('idle'), 2000);
+      setLocalStatus('synced');
+      setTimeout(() => setLocalStatus('idle'), 1500);
     } catch (error) {
       console.error('Export failed:', error);
-      setSyncStatus('error');
-      setTimeout(() => setSyncStatus('idle'), 2000);
+      setLocalStatus('error');
+      setTimeout(() => setLocalStatus('idle'), 1500);
     }
   };
 
   const handleImportWithPassword = async (password: string) => {
-    if (!pendingFile) return;
+    if (!pendingFile) {
+      return;
+    }
 
     try {
       setDialogType(null);
-      setSyncStatus('syncing');
+      setLocalStatus('syncing');
 
       const text = await pendingFile.text();
       const encryptedData = JSON.parse(text);
-
       if (!encryptedData.encrypted) {
         throw new Error('File is not encrypted');
       }
 
-      const decryptedText = await decrypt({
-        data: encryptedData.data,
-        iv: encryptedData.iv,
-        salt: encryptedData.salt,
-      }, password);
+      const decryptedText = await decrypt(
+        {
+          data: encryptedData.data,
+          iv: encryptedData.iv,
+          salt: encryptedData.salt,
+        },
+        password
+      );
 
       const data = JSON.parse(decryptedText);
-
-      if (!data.cookies || !Array.isArray(data.cookies)) {
+      if (!Array.isArray(data.cookies)) {
         throw new Error('Invalid cookie file format');
       }
 
-      const confirmed = confirm(
-        `Import ${data.cookies.length} cookies for ${data.domain}?`
-      );
-
+      const confirmed = confirm(`Import ${data.cookies.length} cookies for ${data.domain}?`);
       if (!confirmed) {
-        setSyncStatus('idle');
+        setLocalStatus('idle');
         return;
       }
 
@@ -113,40 +250,118 @@ function App() {
             sameSite: cookie.sameSite,
             expirationDate: cookie.expirationDate,
           });
-          imported++;
-        } catch (err) {
-          console.warn(`Failed to import cookie ${cookie.name}:`, err);
+          imported += 1;
+        } catch (singleError) {
+          console.warn(`Failed to import cookie ${cookie.name}:`, singleError);
         }
       }
 
-      setSyncStatus('synced');
-      setTimeout(() => {
-        setSyncStatus('idle');
-        alert(`Successfully imported ${imported} of ${data.cookies.length} cookies`);
-      }, 1000);
-
       setPendingFile(null);
+      setLocalStatus('synced');
+      setTimeout(() => {
+        setLocalStatus('idle');
+        alert(`Imported ${imported}/${data.cookies.length} cookies.`);
+      }, 800);
     } catch (error) {
       console.error('Import failed:', error);
-      setSyncStatus('error');
-      setTimeout(() => {
-        setSyncStatus('idle');
-        alert(`Import failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      }, 1000);
       setPendingFile(null);
+      setLocalStatus('error');
+      setTimeout(() => {
+        setLocalStatus('idle');
+        alert(`Import failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }, 800);
     }
   };
 
-  const handleExport = () => {
-    setDialogType('export');
+  const handleConnectGitHub = async () => {
+    setCloudError(null);
+
+    if (!syncPassword.trim()) {
+      setCloudError('Nhập password trước khi connect GitHub.');
+      return;
+    }
+
+    try {
+      setCloudStatus('syncing');
+      await sendBackgroundMessage({
+        type: 'AUTH_CONNECT',
+        password: syncPassword,
+      });
+      await refreshStatus();
+      setCloudStatus('synced');
+      setTimeout(() => setCloudStatus('idle'), 1200);
+    } catch (error) {
+      setCloudStatus('error');
+      setCloudError(error instanceof Error ? error.message : 'GitHub connect thất bại.');
+    }
+  };
+
+  const handleDisconnectGitHub = async () => {
+    setCloudError(null);
+    try {
+      setCloudStatus('syncing');
+      await sendBackgroundMessage({
+        type: 'AUTH_DISCONNECT',
+      });
+      await refreshStatus();
+      setCloudStatus('synced');
+      setTimeout(() => setCloudStatus('idle'), 1000);
+    } catch (error) {
+      setCloudStatus('error');
+      setCloudError(error instanceof Error ? error.message : 'GitHub disconnect thất bại.');
+    }
+  };
+
+  const handleRunCloudSync = async (mode: CloudSyncMode) => {
+    setCloudError(null);
+
+    if (!syncPassword.trim()) {
+      setCloudError('Nhập password để chạy Gist sync.');
+      return;
+    }
+
+    try {
+      setCloudStatus('syncing');
+      await sendBackgroundMessage({
+        type: 'SYNC_RUN',
+        mode,
+        password: syncPassword,
+      });
+      await refreshStatus();
+      setCloudStatus('synced');
+      setTimeout(() => setCloudStatus('idle'), 1200);
+    } catch (error) {
+      setCloudStatus('error');
+      setCloudError(error instanceof Error ? error.message : 'Cloud sync thất bại.');
+    }
+  };
+
+  const handleSaveSettings = async () => {
+    setCloudError(null);
+    const parsedInterval = Number(autoSyncInterval);
+
+    try {
+      setCloudStatus('syncing');
+      await sendBackgroundMessage({
+        type: 'SYNC_SET_SETTINGS',
+        autoSyncIntervalMinutes: parsedInterval,
+        domainWhitelist: normalizeDomainList(domainWhitelistInput),
+      });
+      await refreshStatus();
+      setCloudStatus('synced');
+      setTimeout(() => setCloudStatus('idle'), 1000);
+    } catch (error) {
+      setCloudStatus('error');
+      setCloudError(error instanceof Error ? error.message : 'Lưu sync settings thất bại.');
+    }
   };
 
   const handleImport = () => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.json';
-    input.onchange = async (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
+    input.onchange = (event) => {
+      const file = (event.target as HTMLInputElement).files?.[0];
       if (file) {
         setPendingFile(file);
         setDialogType('import');
@@ -155,98 +370,155 @@ function App() {
     input.click();
   };
 
-  const handleSync = () => {
-    setSyncStatus('syncing');
-    setTimeout(() => {
-      setSyncStatus('synced');
-      setTimeout(() => setSyncStatus('idle'), 2000);
-    }, 1500);
-  };
-
   return (
     <>
-      <div className="w-[360px] min-h-[480px] bg-gradient-to-br from-purple-50 to-blue-50 dark:from-gray-900 dark:to-gray-800">
+      <div className="w-[380px] min-h-[560px] bg-gradient-to-br from-purple-50 to-blue-50 dark:from-gray-900 dark:to-gray-800">
         <div className="bg-white dark:bg-gray-800 shadow-sm p-4 border-b border-gray-200 dark:border-gray-700">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 bg-gradient-to-br from-purple-500 to-blue-500 rounded-lg flex items-center justify-center">
-                <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
-                </svg>
-              </div>
-              <h1 className="text-lg font-semibold text-gray-900 dark:text-white">Sync Cookie</h1>
-            </div>
-            {syncStatus !== 'idle' && (
-              <div className={`px-2 py-1 rounded-full text-xs font-medium ${
-                syncStatus === 'syncing' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300' :
-                syncStatus === 'synced' ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300' :
-                'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'
-              }`}>
-                {syncStatus === 'syncing' ? 'Processing...' :
-                 syncStatus === 'synced' ? 'Success ✓' :
-                 'Error ✗'}
-              </div>
-            )}
+          <div className="flex items-center justify-between gap-2">
+            <h1 className="text-lg font-semibold text-gray-900 dark:text-white">Sync Cookie</h1>
+            <div className="text-xs rounded-full bg-indigo-100 text-indigo-700 px-2 py-1">{cloudBadge}</div>
           </div>
+          <p className="text-xs text-gray-500 mt-1">GitHub OAuth + Gist Sync + local import/export</p>
         </div>
 
-        <div className="p-6">
-          <div className="space-y-3">
-            <button
-              onClick={handleExport}
-              className="w-full bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-900 dark:text-white font-medium py-3 px-4 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 transition-colors flex items-center justify-center gap-2"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              Export (Encrypted)
-            </button>
+        <div className="p-4 space-y-4">
+          <div className="rounded-lg border border-gray-200 bg-white p-3 dark:bg-gray-800 dark:border-gray-700">
+            <p className="text-sm font-semibold text-gray-900 dark:text-white">GitHub OAuth</p>
+            <p className="text-xs text-gray-500 mt-1">
+              Status:{' '}
+              {statusSnapshot?.auth.connected
+                ? `Connected${statusSnapshot?.auth.profile?.login ? ` @${statusSnapshot.auth.profile.login}` : ''}`
+                : 'Not connected'}
+            </p>
+            <input
+              type="password"
+              value={syncPassword}
+              onChange={(event) => setSyncPassword(event.target.value)}
+              placeholder="Sync password"
+              className="mt-2 w-full rounded-md border border-gray-300 px-3 py-2 text-sm dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+            />
 
-            <button
-              onClick={handleImport}
-              className="w-full bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-900 dark:text-white font-medium py-3 px-4 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 transition-colors flex items-center justify-center gap-2"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-              </svg>
-              Import Cookies
-            </button>
+            <div className="grid grid-cols-2 gap-2 mt-2">
+              <button
+                onClick={handleConnectGitHub}
+                disabled={cloudStatus === 'syncing'}
+                className="rounded-md bg-gray-900 text-white text-sm py-2 disabled:opacity-50"
+              >
+                Connect GitHub
+              </button>
+              <button
+                onClick={handleDisconnectGitHub}
+                disabled={cloudStatus === 'syncing'}
+                className="rounded-md bg-gray-100 text-gray-700 text-sm py-2 border border-gray-200 disabled:opacity-50"
+              >
+                Disconnect
+              </button>
+            </div>
 
-            <button
-              onClick={handleSync}
-              disabled={syncStatus === 'syncing'}
-              className="w-full bg-gradient-to-r from-purple-500 to-blue-500 hover:from-purple-600 hover:to-blue-600 disabled:opacity-50 text-white font-medium py-3 px-4 rounded-lg shadow-md transition-all flex items-center justify-center gap-2"
-            >
-              <svg className={`w-5 h-5 ${syncStatus === 'syncing' ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-              Sync Now
-            </button>
+            <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+              Token GitHub được mã hoá và lưu ở extension storage; sync password chỉ giữ trong session runtime.
+              Scope MVP hiện chỉ hỗ trợ host `github.com`, `api.github.com`, `*.atlassian.net` và proxy `*.run.app`.
+            </div>
+
+            {!statusSnapshot?.auth.config.hasGithubClientId || !statusSnapshot?.auth.config.hasOAuthProxyUrl ? (
+              <p className="mt-2 text-xs text-amber-600">
+                Thiếu config env (`VITE_GITHUB_CLIENT_ID` hoặc `VITE_GITHUB_OAUTH_PROXY_URL`).
+              </p>
+            ) : null}
           </div>
 
-          <div className="mt-6 p-4 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
-            <div className="flex items-start gap-2">
-              <svg className="w-5 h-5 text-blue-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              <div className="text-sm text-gray-600 dark:text-gray-400">
-                <p className="font-medium text-gray-900 dark:text-white mb-1">🔐 Secure</p>
-                <ul className="space-y-1 list-disc list-inside">
-                  <li>AES-256 encryption</li>
-                  <li>Export current site</li>
-                  <li>Password protected</li>
-                </ul>
-              </div>
+          <div className="rounded-lg border border-gray-200 bg-white p-3 dark:bg-gray-800 dark:border-gray-700">
+            <p className="text-sm font-semibold text-gray-900 dark:text-white">Gist Sync Actions</p>
+            <div className="grid grid-cols-3 gap-2 mt-2">
+              <button
+                onClick={() => handleRunCloudSync('bidirectional')}
+                disabled={cloudStatus === 'syncing'}
+                className="rounded-md bg-gradient-to-r from-purple-500 to-blue-500 text-white text-sm py-2 disabled:opacity-50"
+              >
+                Sync Now
+              </button>
+              <button
+                onClick={() => handleRunCloudSync('push')}
+                disabled={cloudStatus === 'syncing'}
+                className="rounded-md bg-gray-100 border border-gray-200 text-gray-700 text-sm py-2 disabled:opacity-50"
+              >
+                Push
+              </button>
+              <button
+                onClick={() => handleRunCloudSync('pull')}
+                disabled={cloudStatus === 'syncing'}
+                className="rounded-md bg-gray-100 border border-gray-200 text-gray-700 text-sm py-2 disabled:opacity-50"
+              >
+                Pull
+              </button>
+            </div>
+
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-gray-600">
+              <p>Gist ID: {statusSnapshot?.sync.metadata.gistId ?? 'Chưa có'}</p>
+              <p>Last sync: {formatTimestamp(statusSnapshot?.sync.metadata.lastSyncedAt ?? null)}</p>
+              <p>Manifest: {statusSnapshot?.sync.metadata.manifestVersion ?? 'N/A'}</p>
+              <p>Sync version: {statusSnapshot?.sync.metadata.syncVersion ?? 0}</p>
             </div>
           </div>
 
-          <button className="w-full mt-4 text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 flex items-center justify-center gap-1 transition-colors">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-            Settings
-          </button>
+          <div className="rounded-lg border border-gray-200 bg-white p-3 dark:bg-gray-800 dark:border-gray-700">
+            <p className="text-sm font-semibold text-gray-900 dark:text-white">Auto-sync Settings</p>
+            <div className="mt-2">
+              <label className="text-xs text-gray-500">Interval (minutes 1-60)</label>
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={autoSyncInterval}
+                onChange={(event) => setAutoSyncInterval(event.target.value)}
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+              />
+            </div>
+            <div className="mt-2">
+              <label className="text-xs text-gray-500">Domain whitelist (newline/comma)</label>
+              <textarea
+                value={domainWhitelistInput}
+                onChange={(event) => setDomainWhitelistInput(event.target.value)}
+                placeholder="github.com\nmail.google.com"
+                rows={3}
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+              />
+            </div>
+            <button
+              onClick={handleSaveSettings}
+              disabled={cloudStatus === 'syncing'}
+              className="mt-2 rounded-md bg-gray-900 text-white text-sm py-2 px-3 disabled:opacity-50"
+            >
+              Save Settings
+            </button>
+            <p className="mt-2 text-xs text-gray-500">
+              Runtime: {statusSnapshot?.sync.runtimeState?.status ?? 'N/A'} · Updated:{' '}
+              {formatTimestamp(statusSnapshot?.sync.runtimeState?.updatedAt ?? null)}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-gray-200 bg-white p-3 dark:bg-gray-800 dark:border-gray-700">
+            <p className="text-sm font-semibold text-gray-900 dark:text-white">Local file transfer</p>
+            <div className="grid grid-cols-2 gap-2 mt-2">
+              <button
+                onClick={() => setDialogType('export')}
+                disabled={localStatus === 'syncing'}
+                className="rounded-md bg-gray-900 text-white text-sm py-2 disabled:opacity-50"
+              >
+                Export (encrypted)
+              </button>
+              <button
+                onClick={handleImport}
+                disabled={localStatus === 'syncing'}
+                className="rounded-md bg-gray-100 border border-gray-200 text-gray-700 text-sm py-2 disabled:opacity-50"
+              >
+                Import cookies
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-gray-500">Local status: {localStatus}</p>
+          </div>
+
+          {cloudError ? <p className="text-xs text-red-600">{cloudError}</p> : null}
         </div>
       </div>
 
