@@ -4,7 +4,7 @@ import {
   PBKDF2_ITERATIONS,
   decryptUtf8WithPassword,
   encryptUtf8WithPassword,
-} from './sync-core/gist-sync-crypto';
+} from './sync-core/sync-crypto';
 
 export interface EncryptedData {
   data: string;

@@ -6,15 +6,12 @@
   "permissions": [
     "cookies",
     "storage",
-    "tabs",
-    "identity",
-    "alarms"
+    "tabs"
   ],
   "host_permissions": [
-    "https://github.com/*",
-    "https://api.github.com/*",
-    "https://*.atlassian.net/*",
-    "https://*.run.app/*"
+    "https://*.firebaseio.com/*",
+    "https://identitytoolkit.googleapis.com/*",
+    "https://securetoken.googleapis.com/*"
   ],
   "action": {
     "default_popup": "index.html",

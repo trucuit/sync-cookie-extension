@@ -1,34 +1,29 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment */
 // @ts-nocheck
 
-import { createCookieSyncOrchestrator, createChromeCookieStore } from './lib/sync-core/cookie-sync-orchestrator';
+import { createChromeCookieStore } from './lib/sync-core/cookie-store';
 import {
-  createGitHubCredentialProvider,
-  createGitHubGistSyncClient,
-  normalizeSyncSettings,
-} from './lib/sync-core/gist-sync-foundation';
-import { createGitHubOAuthClient } from './lib/sync-core/github-auth-flow';
+  firebaseRegister,
+  firebaseLogin,
+  firebaseRefreshToken,
+  firebasePush,
+  firebasePull,
+} from './lib/sync-core/simple-sync-client';
+import { encryptUtf8WithPassword, decryptUtf8WithPassword } from './lib/sync-core/sync-crypto';
 
 const STORAGE_KEYS = {
-  token: 'pat.github.oauth.token.v1',
-  profile: 'pat.github.profile.v1',
-  metadata: 'pat.github.sync.metadata.v1',
-  settings: 'pat.github.sync.settings.v1',
-  runtimeState: 'pat.github.sync.runtime.v1',
-  deviceId: 'pat.github.sync.device-id.v1',
-  sessionPassword: 'pat.github.sync.session-password.v1',
+  settings: 'pat.sync.settings.v1',
+  simpleIdToken: 'pat.firebase.sync.id-token.v1',
+  simpleRefreshToken: 'pat.firebase.sync.refresh-token.v1',
+  simpleUid: 'pat.firebase.sync.uid.v1',
+  simpleEmail: 'pat.firebase.sync.email.v1',
+  simpleSyncState: 'pat.firebase.sync.state.v1',
+  simpleTokenTimestamp: 'pat.firebase.sync.token-ts.v1',
 } as const;
 
-const AUTO_SYNC_ALARM = 'pat.github.auto-sync';
-const DEFAULT_SETTINGS = normalizeSyncSettings({
-  autoSyncIntervalMinutes: 5,
-  domainWhitelist: [],
-});
-
 const ENV_CONFIG = {
-  githubClientId: import.meta.env.VITE_GITHUB_CLIENT_ID ?? '',
-  oauthProxyUrl: import.meta.env.VITE_GITHUB_OAUTH_PROXY_URL ?? '',
-  gistFilename: import.meta.env.VITE_GITHUB_GIST_FILENAME ?? 'sync-cookie-manifest.json',
+  firebaseApiKey: import.meta.env.VITE_FIREBASE_API_KEY ?? '',
+  firebaseDbUrl: import.meta.env.VITE_FIREBASE_DB_URL ?? '',
 };
 
 function createCodeError(code: string, message: string, status?: number) {
@@ -38,16 +33,6 @@ function createCodeError(code: string, message: string, status?: number) {
     error.status = status;
   }
   return error;
-}
-
-function requireOAuthConfig() {
-  if (!ENV_CONFIG.githubClientId) {
-    throw createCodeError('auth.config_missing', 'Thiếu VITE_GITHUB_CLIENT_ID trong môi trường build extension.');
-  }
-
-  if (!ENV_CONFIG.oauthProxyUrl) {
-    throw createCodeError('auth.config_missing', 'Thiếu VITE_GITHUB_OAUTH_PROXY_URL để exchange OAuth code.');
-  }
 }
 
 function serializeError(error: unknown) {
@@ -94,361 +79,199 @@ async function removeSessionValue(key: string) {
   await chrome.storage.session.remove(key);
 }
 
-async function getOrCreateDeviceId() {
-  const existing = await getLocalValue<string | null>(STORAGE_KEYS.deviceId, null);
-  if (existing) {
-    return existing;
-  }
-
-  const created = globalThis.crypto?.randomUUID?.() ?? `device-${Date.now()}`;
-  await setLocalValue(STORAGE_KEYS.deviceId, created);
-  return created;
-}
-
-function createOAuthStorageAdapter() {
+function normalizeSyncSettings(input: Record<string, unknown>) {
   return {
-    async getItem(key: string) {
-      const result = await chrome.storage.local.get(key);
-      return result[key] ?? null;
-    },
-    async setItem(key: string, value: unknown) {
-      await chrome.storage.local.set({ [key]: value });
-    },
-    async removeItem(key: string) {
-      await chrome.storage.local.remove(key);
-    },
-  };
-}
-
-function createMetadataStore() {
-  return {
-    async load() {
-      return getLocalValue(STORAGE_KEYS.metadata, {});
-    },
-    async save(nextState: unknown) {
-      await setLocalValue(STORAGE_KEYS.metadata, nextState);
-      return nextState;
-    },
+    domainWhitelist: Array.isArray(input?.domainWhitelist)
+      ? input.domainWhitelist.filter((d: unknown) => typeof d === 'string' && d.trim()).map((d: string) => d.trim().toLowerCase())
+      : [],
   };
 }
 
 async function loadSyncSettings() {
   const raw = await getLocalValue<Record<string, unknown> | null>(STORAGE_KEYS.settings, null);
-  return normalizeSyncSettings(raw ?? DEFAULT_SETTINGS);
+  return normalizeSyncSettings(raw ?? {});
 }
 
-async function saveSyncSettings(input: Record<string, unknown>) {
-  const normalized = normalizeSyncSettings(input);
-  await setLocalValue(STORAGE_KEYS.settings, normalized);
-  await chrome.alarms.create(AUTO_SYNC_ALARM, {
-    periodInMinutes: normalized.autoSyncIntervalMinutes,
-  });
-  return normalized;
-}
+const TOKEN_MAX_AGE_MS = 50 * 60 * 1000; // 50 minutes (Firebase tokens expire at 60 min)
 
-async function loadRuntimeState() {
-  return getLocalValue(STORAGE_KEYS.runtimeState, null);
-}
+async function getValidIdToken(): Promise<{ idToken: string; uid: string }> {
+  const idToken = await getSessionValue<string | null>(STORAGE_KEYS.simpleIdToken, null);
+  const uid = await getSessionValue<string | null>(STORAGE_KEYS.simpleUid, null);
 
-async function saveRuntimeState(state: Record<string, unknown>) {
-  await setLocalValue(STORAGE_KEYS.runtimeState, {
-    ...state,
-    updatedAt: new Date().toISOString(),
-  });
-}
-
-async function fetchGitHubProfile(accessToken: string) {
-  const response = await fetch('https://api.github.com/user', {
-    method: 'GET',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${accessToken}`,
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
-  });
-
-  if (!response.ok) {
-    throw createCodeError('auth.profile_fetch_failed', `Không thể lấy thông tin GitHub profile (${response.status})`, response.status);
+  if (!idToken || !uid) {
+    throw createCodeError('firebase.not_logged_in', 'Đăng nhập trước khi thực hiện thao tác.');
   }
 
-  const profile = await response.json();
-  return {
-    login: profile?.login ?? null,
-    id: profile?.id ?? null,
-    avatarUrl: profile?.avatar_url ?? null,
-    htmlUrl: profile?.html_url ?? null,
-  };
-}
+  const tokenTimestamp = await getSessionValue<number | null>(STORAGE_KEYS.simpleTokenTimestamp, null);
+  const age = tokenTimestamp ? Date.now() - tokenTimestamp : Infinity;
 
-function launchWebAuthFlow(authUrl: string) {
-  return new Promise<string>((resolve, reject) => {
-    chrome.identity.launchWebAuthFlow(
-      {
-        url: authUrl,
-        interactive: true,
-      },
-      (callbackUrl) => {
-        const runtimeError = chrome.runtime.lastError;
-        if (runtimeError) {
-          reject(createCodeError('auth.launch_failed', runtimeError.message ?? 'Không thể mở GitHub OAuth flow'));
-          return;
-        }
-
-        if (!callbackUrl) {
-          reject(createCodeError('auth.callback_missing', 'Không nhận được callback URL từ GitHub OAuth flow.'));
-          return;
-        }
-
-        resolve(callbackUrl);
-      }
-    );
-  });
-}
-
-async function createOAuthClient() {
-  const deviceEntropy = await getOrCreateDeviceId();
-
-  return createGitHubOAuthClient({
-    clientId: ENV_CONFIG.githubClientId,
-    redirectUri: chrome.identity.getRedirectURL('github-callback'),
-    oauthProxyExchangeUrl: ENV_CONFIG.oauthProxyUrl,
-    storage: createOAuthStorageAdapter(),
-    deviceEntropy,
-  });
-}
-
-async function createSyncRuntime(password: string) {
-  if (!password || !password.trim()) {
-    throw createCodeError('sync.password_required', 'Cần nhập password để mã hoá/decrypt dữ liệu sync.');
+  if (age < TOKEN_MAX_AGE_MS) {
+    return { idToken, uid };
   }
 
-  const settings = await loadSyncSettings();
-  const metadataStore = createMetadataStore();
-  const oauthClient = await createOAuthClient();
-  const getAccessToken = createGitHubCredentialProvider({
-    oauthClient,
-    tokenPassword: password,
-    oauthProxyUrl: ENV_CONFIG.oauthProxyUrl,
-  });
-
-  const gistClient = createGitHubGistSyncClient({
-    metadataStore,
-    getAccessToken,
-    gistFilename: ENV_CONFIG.gistFilename,
-    syncSettings: settings,
-  });
-
-  const cookieStore = createChromeCookieStore({
-    chromeApi: chrome,
-    domainWhitelist: settings.domainWhitelist,
-  });
-
-  const deviceId = await getOrCreateDeviceId();
-  const orchestrator = createCookieSyncOrchestrator({
-    cookieStore,
-    gistClient,
-    encryptionPassword: password,
-    deviceId,
-    domainWhitelist: settings.domainWhitelist,
-  });
-
-  return {
-    settings,
-    orchestrator,
-    gistClient,
-  };
-}
-
-async function getStatusSnapshot() {
-  const [tokenState, profile, metadata, settings, runtimeState, sessionPassword] = await Promise.all([
-    getLocalValue(STORAGE_KEYS.token, null),
-    getLocalValue(STORAGE_KEYS.profile, null),
-    getLocalValue(STORAGE_KEYS.metadata, {}),
-    loadSyncSettings(),
-    loadRuntimeState(),
-    getSessionValue<string | null>(STORAGE_KEYS.sessionPassword, null),
-  ]);
-
-  return {
-    auth: {
-      connected: Boolean(tokenState),
-      tokenStored: Boolean(tokenState),
-      profile,
-      config: {
-        hasGithubClientId: Boolean(ENV_CONFIG.githubClientId),
-        hasOAuthProxyUrl: Boolean(ENV_CONFIG.oauthProxyUrl),
-      },
-    },
-    sync: {
-      metadata: {
-        gistId: metadata?.gist?.id ?? null,
-        revision: metadata?.gist?.revision ?? null,
-        lastSyncedAt: metadata?.sync?.lastSyncedAt ?? null,
-        manifestVersion: metadata?.sync?.manifestVersion ?? null,
-        syncVersion: metadata?.sync?.version ?? 0,
-      },
-      settings,
-      runtimeState,
-      hasSessionPassword: Boolean(sessionPassword),
-    },
-  };
-}
-
-async function handleAuthConnect(password: string) {
-  requireOAuthConfig();
-
-  if (!password || !password.trim()) {
-    throw createCodeError('auth.password_required', 'Nhập password để bảo vệ OAuth token trước khi connect.');
+  // Token is near expiry — auto-refresh
+  const refreshTk = await getSessionValue<string | null>(STORAGE_KEYS.simpleRefreshToken, null);
+  if (!refreshTk) {
+    throw createCodeError('firebase.session_expired', 'Session hết hạn. Vui lòng login lại.');
   }
 
-  const oauthClient = await createOAuthClient();
-  const state = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}`;
-  const authUrl = oauthClient.buildAuthorizationUrl({ state });
-  const callbackUrl = await launchWebAuthFlow(authUrl);
-  await oauthClient.handleOAuthCallback({
-    callbackUrl,
-    expectedState: state,
-    password,
+  const result = await firebaseRefreshToken({
+    apiKey: ENV_CONFIG.firebaseApiKey,
+    refreshToken: refreshTk,
   });
 
-  const accessToken = await oauthClient.getAccessToken({
-    password,
-    forceValidate: true,
-  });
+  await setSessionValue(STORAGE_KEYS.simpleIdToken, result.idToken);
+  await setSessionValue(STORAGE_KEYS.simpleRefreshToken, result.refreshToken);
+  await setSessionValue(STORAGE_KEYS.simpleTokenTimestamp, Date.now());
 
-  if (!accessToken) {
-    throw createCodeError('auth.exchange_failed', 'OAuth flow hoàn tất nhưng không lấy được access token.');
-  }
-
-  const profile = await fetchGitHubProfile(accessToken);
-  await setLocalValue(STORAGE_KEYS.profile, profile);
-  await setSessionValue(STORAGE_KEYS.sessionPassword, password);
-
-  return {
-    connected: true,
-    profile,
-  };
+  return { idToken: result.idToken, uid: result.uid ?? uid };
 }
 
-async function handleAuthDisconnect() {
-  const oauthClient = await createOAuthClient();
-  await oauthClient.clearAccessToken();
-  await removeLocalValue(STORAGE_KEYS.profile);
-  await removeSessionValue(STORAGE_KEYS.sessionPassword);
 
-  return {
-    connected: false,
-  };
-}
-
-async function runSync(mode: 'push' | 'pull' | 'bidirectional', password: string, source: 'manual' | 'auto') {
-  const runtime = await createSyncRuntime(password);
-
-  let result;
-  if (mode === 'push') {
-    result = await runtime.orchestrator.pushLocalToCloud();
-  } else if (mode === 'pull') {
-    result = await runtime.orchestrator.pullRemoteToLocal();
-  } else {
-    result = await runtime.orchestrator.syncBidirectional();
-  }
-
-  await setSessionValue(STORAGE_KEYS.sessionPassword, password);
-  await saveRuntimeState({
-    source,
-    mode,
-    status: 'success',
-    result,
-  });
-
-  return result;
-}
-
-async function runAutoSyncIfPossible() {
-  try {
-    const password = await getSessionValue<string | null>(STORAGE_KEYS.sessionPassword, null);
-    if (!password) {
-      await saveRuntimeState({
-        source: 'auto',
-        mode: 'bidirectional',
-        status: 'skipped',
-        reason: 'missing_session_password',
-      });
-      return;
-    }
-
-    await runSync('bidirectional', password, 'auto');
-  } catch (error) {
-    await saveRuntimeState({
-      source: 'auto',
-      mode: 'bidirectional',
-      status: 'error',
-      error: serializeError(error),
-    });
-  }
-}
-
-async function initializeSyncDefaults() {
-  const savedSettings = await getLocalValue<Record<string, unknown> | null>(STORAGE_KEYS.settings, null);
-  if (!savedSettings) {
-    await saveSyncSettings(DEFAULT_SETTINGS);
-    return;
-  }
-
-  await saveSyncSettings(savedSettings);
-}
+// ─── Listeners ─────────────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log('Sync Cookie Extension installed');
-  void initializeSyncDefaults();
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  void initializeSyncDefaults();
-});
-
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === AUTO_SYNC_ALARM) {
-    void runAutoSyncIfPossible();
-  }
 });
 
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   (async () => {
     switch (request?.type) {
-      case 'SYNC_GET_STATUS': {
-        const data = await getStatusSnapshot();
-        sendResponse({ ok: true, data });
-        return;
-      }
+      // ─── Firebase Sync handlers ─────────────────────────────────────
 
-      case 'AUTH_CONNECT': {
-        const data = await handleAuthConnect(request.password ?? '');
-        sendResponse({ ok: true, data });
-        return;
-      }
-
-      case 'AUTH_DISCONNECT': {
-        const data = await handleAuthDisconnect();
-        sendResponse({ ok: true, data });
-        return;
-      }
-
-      case 'SYNC_SET_SETTINGS': {
-        const settings = await saveSyncSettings({
-          autoSyncIntervalMinutes: request.autoSyncIntervalMinutes,
-          domainWhitelist: request.domainWhitelist,
+      case 'SIMPLE_AUTH_REGISTER': {
+        const result = await firebaseRegister({
+          apiKey: ENV_CONFIG.firebaseApiKey,
+          email: request.email ?? '',
+          password: request.password ?? '',
         });
-        sendResponse({ ok: true, data: settings });
+        await setSessionValue(STORAGE_KEYS.simpleIdToken, result.idToken);
+        await setSessionValue(STORAGE_KEYS.simpleRefreshToken, result.refreshToken);
+        await setSessionValue(STORAGE_KEYS.simpleUid, result.uid);
+        await setSessionValue(STORAGE_KEYS.simpleEmail, result.email);
+        await setSessionValue(STORAGE_KEYS.simpleTokenTimestamp, Date.now());
+        sendResponse({ ok: true, data: { email: result.email, uid: result.uid } });
         return;
       }
 
-      case 'SYNC_RUN': {
-        const mode = request.mode ?? 'bidirectional';
-        const password = request.password ?? '';
-        const result = await runSync(mode, password, 'manual');
-        const status = await getStatusSnapshot();
-        sendResponse({ ok: true, data: { result, status } });
+      case 'SIMPLE_AUTH_LOGIN': {
+        const result = await firebaseLogin({
+          apiKey: ENV_CONFIG.firebaseApiKey,
+          email: request.email ?? '',
+          password: request.password ?? '',
+        });
+        await setSessionValue(STORAGE_KEYS.simpleIdToken, result.idToken);
+        await setSessionValue(STORAGE_KEYS.simpleRefreshToken, result.refreshToken);
+        await setSessionValue(STORAGE_KEYS.simpleUid, result.uid);
+        await setSessionValue(STORAGE_KEYS.simpleEmail, result.email);
+        await setSessionValue(STORAGE_KEYS.simpleTokenTimestamp, Date.now());
+        sendResponse({ ok: true, data: { email: result.email, uid: result.uid } });
+        return;
+      }
+
+      case 'SIMPLE_AUTH_LOGOUT': {
+        await removeSessionValue(STORAGE_KEYS.simpleIdToken);
+        await removeSessionValue(STORAGE_KEYS.simpleRefreshToken);
+        await removeSessionValue(STORAGE_KEYS.simpleUid);
+        await removeSessionValue(STORAGE_KEYS.simpleEmail);
+        await removeSessionValue(STORAGE_KEYS.simpleTokenTimestamp);
+        await removeLocalValue(STORAGE_KEYS.simpleSyncState);
+        sendResponse({ ok: true, data: { loggedOut: true } });
+        return;
+      }
+
+      case 'SIMPLE_SYNC_PUSH': {
+        const { idToken, uid } = await getValidIdToken();
+
+        const syncPassword = request.password ?? '';
+        if (!syncPassword.trim()) {
+          throw createCodeError('firebase.password_required', 'Nhập sync password để mã hoá cookies.');
+        }
+
+        const settings = await loadSyncSettings();
+        const cookieStore = createChromeCookieStore({
+          chromeApi: chrome,
+          domainWhitelist: settings.domainWhitelist,
+        });
+        const cookies = await cookieStore.readCookies({ domainWhitelist: settings.domainWhitelist });
+
+        const encrypted = await encryptUtf8WithPassword({
+          plaintext: JSON.stringify({ cookies, pushedAt: new Date().toISOString() }),
+          password: syncPassword,
+        });
+
+        await firebasePush({
+          dbUrl: ENV_CONFIG.firebaseDbUrl,
+          idToken,
+          uid,
+          payload: JSON.stringify(encrypted),
+        });
+
+        await setLocalValue(STORAGE_KEYS.simpleSyncState, {
+          lastPushedAt: new Date().toISOString(),
+          cookieCount: cookies.length,
+        });
+
+        sendResponse({ ok: true, data: { cookieCount: cookies.length } });
+        return;
+      }
+
+      case 'SIMPLE_SYNC_PULL': {
+        const { idToken, uid } = await getValidIdToken();
+
+        const syncPassword = request.password ?? '';
+        if (!syncPassword.trim()) {
+          throw createCodeError('firebase.password_required', 'Nhập sync password để giải mã cookies.');
+        }
+
+        const pullResult = await firebasePull({
+          dbUrl: ENV_CONFIG.firebaseDbUrl,
+          idToken,
+          uid,
+        });
+        const encryptedPayload = JSON.parse(pullResult.payload);
+
+        const decrypted = await decryptUtf8WithPassword({
+          encryptedPayload,
+          password: syncPassword,
+        });
+
+        const parsed = JSON.parse(decrypted);
+        if (!Array.isArray(parsed.cookies)) {
+          throw createCodeError('firebase.invalid_payload', 'Dữ liệu sync không hợp lệ.');
+        }
+
+        const settings = await loadSyncSettings();
+        const cookieStore = createChromeCookieStore({
+          chromeApi: chrome,
+          domainWhitelist: settings.domainWhitelist,
+        });
+        const writeResult = await cookieStore.replaceCookies(parsed.cookies, { domainWhitelist: settings.domainWhitelist });
+
+        await setLocalValue(STORAGE_KEYS.simpleSyncState, {
+          lastPulledAt: new Date().toISOString(),
+          cookieCount: parsed.cookies.length,
+        });
+
+        sendResponse({ ok: true, data: { ...writeResult, cookieCount: parsed.cookies.length, pulledAt: pullResult.updatedAt } });
+        return;
+      }
+
+      case 'SIMPLE_SYNC_STATUS': {
+        const [simpleIdToken, simpleEmail, simpleSyncState] = await Promise.all([
+          getSessionValue(STORAGE_KEYS.simpleIdToken, null),
+          getSessionValue(STORAGE_KEYS.simpleEmail, null),
+          getLocalValue(STORAGE_KEYS.simpleSyncState, null),
+        ]);
+
+        sendResponse({
+          ok: true,
+          data: {
+            loggedIn: Boolean(simpleIdToken),
+            email: simpleEmail,
+            syncState: simpleSyncState,
+          },
+        });
         return;
       }
 

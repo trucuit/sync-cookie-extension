@@ -15,7 +15,7 @@ describe('extension manifest security settings', () => {
     expect(manifest.content_security_policy?.extension_pages).toContain("object-src 'self'");
   });
 
-  it('keeps permissions minimal for MVP runtime scope', () => {
+  it('keeps permissions minimal for Firebase sync scope', () => {
     const manifestPath = resolve(process.cwd(), 'src/manifest.json');
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
       permissions?: string[];
@@ -24,15 +24,16 @@ describe('extension manifest security settings', () => {
     };
 
     expect(manifest.permissions).toEqual(
-      expect.arrayContaining(['cookies', 'storage', 'tabs', 'identity', 'alarms'])
+      expect.arrayContaining(['cookies', 'storage', 'tabs'])
     );
     expect(manifest.permissions).not.toContain('activeTab');
+    expect(manifest.permissions).not.toContain('identity');
+    expect(manifest.permissions).not.toContain('alarms');
 
     expect(manifest.host_permissions).toEqual([
-      'https://github.com/*',
-      'https://api.github.com/*',
-      'https://*.atlassian.net/*',
-      'https://*.run.app/*',
+      'https://*.firebaseio.com/*',
+      'https://identitytoolkit.googleapis.com/*',
+      'https://securetoken.googleapis.com/*',
     ]);
     expect(manifest.host_permissions).not.toContain('<all_urls>');
     expect(manifest.content_scripts ?? []).toHaveLength(0);
