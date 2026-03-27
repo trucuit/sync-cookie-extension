@@ -127,14 +127,14 @@ describe('simple-sync-client (Firebase proxy)', () => {
     it('pushes data through proxy', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ ok: true, updatedAt: '2026-01-01T00:00:00Z', uid: 'uid-1' }),
+        json: async () => ({ ok: true, updatedAt: '2026-01-01T00:00:00Z', uid: 'uid-1', recordCount: 2 }),
       });
 
       const { firebasePush } = await importClient();
       const result = await firebasePush({
         proxyBaseUrl: 'https://proxy.example.com',
         idToken: 'tk',
-        payload: '{"data":1}',
+        records: [{ domain: 'chatgpt.com', payload: '{"data":1}' }],
       });
 
       expect(result.ok).toBe(true);
@@ -142,6 +142,7 @@ describe('simple-sync-client (Firebase proxy)', () => {
       const [url, options] = mockFetch.mock.calls[0];
       expect(url).toBe('https://proxy.example.com/firebase/sync/push');
       expect(options.body).toContain('"idToken":"tk"');
+      expect(options.body).toContain('"records"');
     });
   });
 
@@ -151,8 +152,12 @@ describe('simple-sync-client (Firebase proxy)', () => {
         ok: true,
         json: async () => ({
           ok: true,
-          payload: '{"cookies":[]}',
-          updatedAt: '2026-01-01T00:00:00Z',
+          records: [{
+            domain: 'chatgpt.com',
+            payload: '{"cookies":[]}',
+            updatedAt: '2026-01-01T00:00:00Z',
+          }],
+          legacyRecord: null,
           uid: 'uid-1',
         }),
       });
@@ -163,7 +168,8 @@ describe('simple-sync-client (Firebase proxy)', () => {
         idToken: 'tk',
       });
 
-      expect(result.payload).toBe('{"cookies":[]}');
+      expect(result.records).toHaveLength(1);
+      expect(result.records[0].domain).toBe('chatgpt.com');
       const [url] = mockFetch.mock.calls[0];
       expect(url).toBe('https://proxy.example.com/firebase/sync/pull');
     });
@@ -171,7 +177,7 @@ describe('simple-sync-client (Firebase proxy)', () => {
     it('throws when payload is empty', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ ok: true, payload: null }),
+        json: async () => ({ ok: true, records: [], legacyRecord: null }),
       });
 
       const { firebasePull } = await importClient();

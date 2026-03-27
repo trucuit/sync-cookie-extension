@@ -10,9 +10,15 @@ import {
   firebasePull,
 } from './lib/sync-core/simple-sync-client';
 import { encryptUtf8WithPassword, decryptUtf8WithPassword } from './lib/sync-core/sync-crypto';
+import {
+  DEFAULT_DOMAIN_WHITELIST,
+  findDomainMatch,
+  groupCookiesByDomain,
+  normalizeDomainWhitelist,
+} from './lib/sync-core/sync-records';
+import { DEFAULT_SYNC_PASSWORD } from './lib/sync-core/default-sync-password';
 
 const STORAGE_KEYS = {
-  settings: 'pat.sync.settings.v1',
   simpleIdToken: 'pat.firebase.sync.id-token.v1',
   simpleRefreshToken: 'pat.firebase.sync.refresh-token.v1',
   simpleUid: 'pat.firebase.sync.uid.v1',
@@ -21,21 +27,6 @@ const STORAGE_KEYS = {
   simpleTokenTimestamp: 'pat.firebase.sync.token-ts.v1',
 } as const;
 
-const ENV_CONFIG = {
-  firebaseProxyUrl: import.meta.env.VITE_FIREBASE_PROXY_URL ?? '',
-};
-
-function requireFirebaseProxyUrl() {
-  const proxyUrl = `${ENV_CONFIG.firebaseProxyUrl ?? ''}`.trim();
-  if (!proxyUrl) {
-    throw createCodeError(
-      'config.missing_proxy_url',
-      'Thiếu VITE_FIREBASE_PROXY_URL. Hãy cấu hình Firebase proxy trước khi dùng sync.',
-    );
-  }
-
-  return proxyUrl;
-}
 
 function createCodeError(code: string, message: string, status?: number) {
   const error = new Error(message) as Error & { code?: string; status?: number };
@@ -90,22 +81,86 @@ async function removeSessionValue(key: string) {
   await chrome.storage.session.remove(key);
 }
 
-function normalizeSyncSettings(input: Record<string, unknown>) {
+async function loadSyncSettings() {
+  return { domainWhitelist: normalizeDomainWhitelist(DEFAULT_DOMAIN_WHITELIST) };
+}
+
+async function buildSyncPushRecords({ cookies, domainWhitelist, password }: {
+  cookies: unknown[];
+  domainWhitelist: string[];
+  password: string;
+}) {
+  const groupedCookies = groupCookiesByDomain(cookies, domainWhitelist);
+  const records = [];
+
+  for (const [domain, siteCookies] of Object.entries(groupedCookies)) {
+    const encrypted = await encryptUtf8WithPassword({
+      plaintext: JSON.stringify({ domain, cookies: siteCookies, pushedAt: new Date().toISOString() }),
+      password,
+    });
+
+    records.push({
+      domain,
+      payload: JSON.stringify(encrypted),
+    });
+  }
+
+  return records;
+}
+
+async function decryptSiteRecord({ domain, payload, password }: {
+  domain: string;
+  payload: string;
+  password: string;
+}) {
+  const encryptedPayload = JSON.parse(payload);
+  const decrypted = await decryptUtf8WithPassword({
+    encryptedPayload,
+    password,
+  });
+  const parsed = JSON.parse(decrypted);
+
+  if (!Array.isArray(parsed.cookies)) {
+    throw createCodeError('firebase.invalid_payload', 'Dữ liệu sync không hợp lệ.');
+  }
+
+  const matchedDomain = findDomainMatch(parsed.domain ?? domain, [domain]);
+  if (!matchedDomain) {
+    throw createCodeError('firebase.invalid_payload', 'Domain record không hợp lệ.');
+  }
+
   return {
-    domainWhitelist: Array.isArray(input?.domainWhitelist)
-      ? input.domainWhitelist.filter((d: unknown) => typeof d === 'string' && d.trim()).map((d: string) => d.trim().toLowerCase())
-      : [],
+    domain: matchedDomain,
+    cookies: parsed.cookies,
   };
 }
 
-async function loadSyncSettings() {
-  const raw = await getLocalValue<Record<string, unknown> | null>(STORAGE_KEYS.settings, null);
-  return normalizeSyncSettings(raw ?? {});
+async function expandLegacyRecord({ legacyRecord, password, domainWhitelist }: {
+  legacyRecord: { payload: string; updatedAt: string | null };
+  password: string;
+  domainWhitelist: string[];
+}) {
+  const encryptedPayload = JSON.parse(legacyRecord.payload);
+  const decrypted = await decryptUtf8WithPassword({
+    encryptedPayload,
+    password,
+  });
+  const parsed = JSON.parse(decrypted);
+
+  if (!Array.isArray(parsed.cookies)) {
+    throw createCodeError('firebase.invalid_payload', 'Dữ liệu sync không hợp lệ.');
+  }
+
+  const groupedCookies = groupCookiesByDomain(parsed.cookies, domainWhitelist);
+  return Object.entries(groupedCookies).map(([domain, cookies]) => ({
+    domain,
+    cookies,
+  }));
 }
 
 const TOKEN_MAX_AGE_MS = 50 * 60 * 1000; // 50 minutes (Firebase tokens expire at 60 min)
 
-async function getValidIdToken(proxyBaseUrl: string): Promise<{ idToken: string; uid: string }> {
+async function getValidIdToken(): Promise<{ idToken: string; uid: string }> {
   const idToken = await getSessionValue<string | null>(STORAGE_KEYS.simpleIdToken, null);
   const uid = await getSessionValue<string | null>(STORAGE_KEYS.simpleUid, null);
 
@@ -127,7 +182,6 @@ async function getValidIdToken(proxyBaseUrl: string): Promise<{ idToken: string;
   }
 
   const result = await firebaseRefreshToken({
-    proxyBaseUrl,
     refreshToken: refreshTk,
   });
 
@@ -154,9 +208,7 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       // ─── Firebase Sync handlers ─────────────────────────────────────
 
       case 'SIMPLE_AUTH_REGISTER': {
-        const proxyBaseUrl = requireFirebaseProxyUrl();
         const result = await firebaseRegister({
-          proxyBaseUrl,
           email: request.email ?? '',
           password: request.password ?? '',
         });
@@ -170,9 +222,7 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       }
 
       case 'SIMPLE_AUTH_LOGIN': {
-        const proxyBaseUrl = requireFirebaseProxyUrl();
         const result = await firebaseLogin({
-          proxyBaseUrl,
           email: request.email ?? '',
           password: request.password ?? '',
         });
@@ -197,13 +247,9 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       }
 
       case 'SIMPLE_SYNC_PUSH': {
-        const proxyBaseUrl = requireFirebaseProxyUrl();
-        const { idToken } = await getValidIdToken(proxyBaseUrl);
+        const { idToken, uid } = await getValidIdToken();
 
-        const syncPassword = request.password ?? '';
-        if (!syncPassword.trim()) {
-          throw createCodeError('firebase.password_required', 'Nhập sync password để mã hoá cookies.');
-        }
+        const syncPassword = `${request.password ?? ''}`.trim() || DEFAULT_SYNC_PASSWORD;
 
         const settings = await loadSyncSettings();
         const cookieStore = createChromeCookieStore({
@@ -211,16 +257,19 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
           domainWhitelist: settings.domainWhitelist,
         });
         const cookies = await cookieStore.readCookies({ domainWhitelist: settings.domainWhitelist });
-
-        const encrypted = await encryptUtf8WithPassword({
-          plaintext: JSON.stringify({ cookies, pushedAt: new Date().toISOString() }),
+        const records = await buildSyncPushRecords({
+          cookies,
+          domainWhitelist: settings.domainWhitelist,
           password: syncPassword,
         });
+        if (records.length === 0) {
+          throw createCodeError('firebase.no_cookies', 'Không có cookies thuộc whitelist để sync.');
+        }
 
         await firebasePush({
-          proxyBaseUrl,
           idToken,
-          payload: JSON.stringify(encrypted),
+          uid,
+          records,
         });
 
         await setLocalValue(STORAGE_KEYS.simpleSyncState, {
@@ -233,43 +282,61 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       }
 
       case 'SIMPLE_SYNC_PULL': {
-        const proxyBaseUrl = requireFirebaseProxyUrl();
-        const { idToken } = await getValidIdToken(proxyBaseUrl);
+        const { idToken, uid } = await getValidIdToken();
 
-        const syncPassword = request.password ?? '';
-        if (!syncPassword.trim()) {
-          throw createCodeError('firebase.password_required', 'Nhập sync password để giải mã cookies.');
-        }
+        const syncPassword = `${request.password ?? ''}`.trim() || DEFAULT_SYNC_PASSWORD;
 
         const pullResult = await firebasePull({
-          proxyBaseUrl,
           idToken,
+          uid,
         });
-        const encryptedPayload = JSON.parse(pullResult.payload);
-
-        const decrypted = await decryptUtf8WithPassword({
-          encryptedPayload,
-          password: syncPassword,
-        });
-
-        const parsed = JSON.parse(decrypted);
-        if (!Array.isArray(parsed.cookies)) {
-          throw createCodeError('firebase.invalid_payload', 'Dữ liệu sync không hợp lệ.');
-        }
 
         const settings = await loadSyncSettings();
         const cookieStore = createChromeCookieStore({
           chromeApi: chrome,
           domainWhitelist: settings.domainWhitelist,
         });
-        const writeResult = await cookieStore.replaceCookies(parsed.cookies, { domainWhitelist: settings.domainWhitelist });
+        const siteEntries = pullResult.records.length > 0
+          ? await Promise.all(
+            pullResult.records
+              .filter((record: { domain?: string }) => Boolean(findDomainMatch(record.domain ?? '', settings.domainWhitelist)))
+              .map((record: { domain: string; payload: string }) => decryptSiteRecord({
+                domain: record.domain,
+                payload: record.payload,
+                password: syncPassword,
+              }))
+          )
+          : pullResult.legacyRecord
+            ? await expandLegacyRecord({
+              legacyRecord: pullResult.legacyRecord,
+              password: syncPassword,
+              domainWhitelist: settings.domainWhitelist,
+            })
+            : [];
+
+        if (siteEntries.length === 0) {
+          throw createCodeError('firebase.no_data', 'Không có dữ liệu sync phù hợp với whitelist hiện tại.');
+        }
+
+        let removed = 0;
+        let written = 0;
+        let skipped = 0;
+        let cookieCount = 0;
+
+        for (const entry of siteEntries) {
+          const writeResult = await cookieStore.replaceCookies(entry.cookies, { domainWhitelist: [entry.domain] });
+          removed += writeResult.removed;
+          written += writeResult.written;
+          skipped += writeResult.skipped;
+          cookieCount += entry.cookies.length;
+        }
 
         await setLocalValue(STORAGE_KEYS.simpleSyncState, {
           lastPulledAt: new Date().toISOString(),
-          cookieCount: parsed.cookies.length,
+          cookieCount,
         });
 
-        sendResponse({ ok: true, data: { ...writeResult, cookieCount: parsed.cookies.length, pulledAt: pullResult.updatedAt } });
+        sendResponse({ ok: true, data: { removed, written, skipped, cookieCount } });
         return;
       }
 

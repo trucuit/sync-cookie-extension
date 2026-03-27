@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "push:auth:admin": "node ./scripts/push-auth-to-firebase-admin.mjs",
+    "push:auth:proxy": "node ./scripts/push-auth-to-firebase.mjs",
     "security:artifact": "bash ./scripts/check-no-firebase-secrets.sh dist",
     "smoke:preview": "bash ./scripts/smoke-preview.sh",
     "test": "vitest run",
@@ -14,6 +16,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "firebase-admin": "^13.7.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },

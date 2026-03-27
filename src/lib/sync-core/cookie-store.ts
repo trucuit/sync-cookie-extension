@@ -113,18 +113,28 @@ function deriveCookieUrl(cookie) {
   return `${protocol}://${hostname}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
+function isHostPrefixCookie(name) {
+  return typeof name === 'string' && name.startsWith('__Host-');
+}
+
 function toChromeSetDetails(cookie) {
+  const hostPrefix = isHostPrefixCookie(cookie.name);
+
   const payload = {
     url: deriveCookieUrl(cookie),
     name: cookie.name,
     value: cookie.value,
-    path: cookie.path,
-    secure: Boolean(cookie.secure),
+    path: hostPrefix ? '/' : cookie.path,
+    secure: hostPrefix ? true : Boolean(cookie.secure),
     httpOnly: Boolean(cookie.httpOnly),
     sameSite: toChromeSameSite(cookie.sameSite),
     storeId: cookie.storeId,
-    domain: cookie.domain,
   };
+
+  // __Host- cookies MUST NOT have a domain attribute
+  if (!hostPrefix) {
+    payload.domain = cookie.domain;
+  }
 
   const expiresMs = parseIsoTimestamp(cookie.expiresAt);
   if (expiresMs !== null) {
@@ -208,8 +218,13 @@ export function createChromeCookieStore({ chromeApi = globalThis.chrome, domainW
         continue;
       }
 
-      await callChromeCookiesApi(chromeApi, 'set', toChromeSetDetails(cookie));
-      written += 1;
+      try {
+        await callChromeCookiesApi(chromeApi, 'set', toChromeSetDetails(cookie));
+        written += 1;
+      } catch (error) {
+        console.warn(`[SyncCookie] Failed to set cookie "${cookie.name}":`, error?.message ?? error);
+        skipped += 1;
+      }
     }
 
     return { written, skipped };

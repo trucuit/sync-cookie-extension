@@ -6,7 +6,17 @@
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
         ".write": "auth != null && auth.uid === $uid",
-        ".validate": "newData.hasChildren(['payload', 'updatedAt']) && newData.child('payload').isString() && newData.child('updatedAt').isString()"
+        "payload": {
+          ".validate": "newData.isString()"
+        },
+        "updatedAt": {
+          ".validate": "newData.isString()"
+        },
+        "sites": {
+          "$domainKey": {
+            ".validate": "newData.hasChildren(['domain', 'payload', 'updatedAt']) && newData.child('domain').isString() && newData.child('payload').isString() && newData.child('updatedAt').isString()"
+          }
+        }
       }
     }
   }

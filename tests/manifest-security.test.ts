@@ -1,28 +1,14 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import manifest from '../src/manifest';
+import { buildCookieHostPermissions, SUPPORTED_SYNC_DOMAINS } from '../src/lib/sync-core/sync-records';
 
 describe('extension manifest security settings', () => {
   it('defines explicit CSP for extension pages', () => {
-    const manifestPath = resolve(process.cwd(), 'src/manifest.json');
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
-      content_security_policy?: {
-        extension_pages?: string;
-      };
-    };
-
     expect(manifest.content_security_policy?.extension_pages).toContain("script-src 'self'");
     expect(manifest.content_security_policy?.extension_pages).toContain("object-src 'self'");
   });
 
   it('keeps permissions minimal for proxy-based sync scope', () => {
-    const manifestPath = resolve(process.cwd(), 'src/manifest.json');
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
-      permissions?: string[];
-      host_permissions?: string[];
-      content_scripts?: unknown[];
-    };
-
     expect(manifest.permissions).toEqual(
       expect.arrayContaining(['cookies', 'storage', 'tabs'])
     );
@@ -34,6 +20,7 @@ describe('extension manifest security settings', () => {
       'https://*.run.app/*',
       'http://localhost/*',
       'http://127.0.0.1/*',
+      ...buildCookieHostPermissions(SUPPORTED_SYNC_DOMAINS),
     ]);
     expect(manifest.host_permissions).not.toContain('<all_urls>');
     expect(manifest.content_scripts ?? []).toHaveLength(0);

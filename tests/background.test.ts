@@ -103,6 +103,28 @@ describe('background service worker', () => {
     });
   });
 
+  it('returns default sync settings when none are saved', async () => {
+    await import('../src/background');
+
+    const messageHandler = onMessageAddListener.mock.calls[0]?.[0] as RuntimeMessageHandler | undefined;
+    expect(messageHandler).toBeTypeOf('function');
+
+    const sendResponse = vi.fn();
+    const keepChannelOpen = messageHandler?.({ type: 'SIMPLE_SYNC_GET_SETTINGS' }, {}, sendResponse);
+    expect(keepChannelOpen).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ok: true,
+          data: expect.objectContaining({
+            domainWhitelist: expect.arrayContaining(['chatgpt.com', 'claude.ai', 'gemini.google.com']),
+          }),
+        })
+      );
+    });
+  });
+
   it('returns error for unsupported request type', async () => {
     await import('../src/background');
 
